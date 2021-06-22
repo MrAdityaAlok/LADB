@@ -3,15 +3,19 @@ package com.draco.ladb.utils
 import android.content.Context
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
+import androidx.preference.PreferenceManager
+import com.draco.ladb.R
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
+import java.io.IOException
 import java.io.PrintStream
 
 class ADB(private val context: Context) {
     companion object {
-        const val MAX_OUTPUT_BUFFER_SIZE = 1024 * 4
+        const val MAX_OUTPUT_BUFFER_SIZE = 1024 * 16
         const val OUTPUT_BUFFER_DELAY_MS = 100L
 
         @Volatile private var instance: ADB? = null
@@ -20,77 +24,156 @@ class ADB(private val context: Context) {
         }
     }
 
+    private val sharedPrefs = PreferenceManager.getDefaultSharedPreferences(context)
+
     private val adbPath = "${context.applicationInfo.nativeLibraryDir}/libadb.so"
     private val scriptPath = "${context.getExternalFilesDir(null)}/script.sh"
 
-    private val ready = MutableLiveData<Boolean>()
-    fun getReady(): LiveData<Boolean> = ready
+    /**
+     * Is the shell ready to handle commands?
+     */
+    private val _ready = MutableLiveData<Boolean>()
+    val ready: LiveData<Boolean> = _ready
 
-    lateinit var shellProcess: Process
+    /**
+     * Is the shell closed for any reason?
+     */
+    private val _closed = MutableLiveData<Boolean>()
+    val closed: LiveData<Boolean> = _closed
 
+    /**
+     * Where shell output is stored
+     */
     val outputBufferFile: File = File.createTempFile("buffer", ".txt").also {
         it.deleteOnExit()
     }
 
+    /**
+     * Single shell instance where we can pipe commands to
+     */
+    private var shellProcess: Process? = null
+
+    /**
+     * Decide how to initialize the shellProcess variable
+     */
     fun initializeClient() {
-        if (ready.value == true)
+        if (_ready.value == true)
             return
 
-        debug("Waiting for device to accept connection. This part may take a while.")
-        send(false, "wait-for-device").waitFor()
-
-        debug("Shelling into device")
-        shellProcess = send(true, "shell")
-        ready.postValue(true)
-
-        shellDeathListener()
+        val autoShell = sharedPrefs.getBoolean(context.getString(R.string.auto_shell_key), true)
+        if (autoShell)
+            initializeADBShell()
+        else
+            initializeShell()
     }
 
-    private fun shellDeathListener() {
+    /**
+     * Scan and make a connection to a wireless device
+     */
+    private fun initializeADBShell() {
+        debug("Starting ADB client")
+        adb(false, listOf("start-server"))?.waitFor()
+        debug("Waiting for device to be found")
+        adb(false, listOf("wait-for-device"))?.waitFor()
+
+        debug("Shelling into device")
+        val process = adb(true, listOf("-t", "1", "shell"))
+        if (process == null) {
+            debug("Failed to open shell connection")
+            return
+        }
+        shellProcess = process
+        sendToShellProcess("echo 'Success! ※\\(^o^)/※'")
+        _ready.postValue(true)
+
+        startShellDeathThread()
+    }
+
+    /**
+     * Make a local shell instance
+     */
+    private fun initializeShell() {
+        debug("Shelling into device")
+        val process = shell(true, listOf("sh", "-l"))
+        if (process == null) {
+            debug("Failed to open shell connection")
+            return
+        }
+        shellProcess = process
+        sendToShellProcess("alias adb=\"$adbPath\"")
+        sendToShellProcess("echo 'Success! ※\\(^o^)/※'")
+        _ready.postValue(true)
+
+        startShellDeathThread()
+    }
+
+    /**
+     * Start a death listener to restart the shell once it dies
+     */
+    private fun startShellDeathThread() {
         GlobalScope.launch(Dispatchers.IO) {
-            shellProcess.waitFor()
-            ready.postValue(false)
-            debug("Shell has died")
+            shellProcess?.waitFor()
+            _ready.postValue(false)
+            debug("Shell is dead, resetting")
+            delay(1_000)
+            adb(false, listOf("kill-server"))?.waitFor()
+            initializeClient()
         }
     }
 
+    /**
+     * Completely reset the ADB client
+     */
     fun reset() {
-        ready.postValue(false)
+        _ready.postValue(false)
         outputBufferFile.writeText("")
+        debug("Destroying shell process")
+        shellProcess?.destroyForcibly()
         debug("Disconnecting all clients")
-        send(false, "disconnect").waitFor()
-        debug("Killing server")
-        send(false, "kill-server").waitFor()
-        debug("Clearing pairing memory")
+        adb(false, listOf("disconnect"))?.waitFor()
+        debug("Killing ADB server")
+        adb(false, listOf("kill-server"))?.waitFor()
         debug("Erasing all ADB server files")
         context.filesDir.deleteRecursively()
-        debug("LADB reset complete, please restart the client.")
+        context.cacheDir.deleteRecursively()
+        _closed.postValue(true)
     }
 
+    /**
+     * Ask the device to pair on Android 11 phones
+     */
     fun pair(port: String, pairingCode: String) {
-        val pairShell = send(true, "pair", "localhost:$port")
+        val pairShell = adb(true, listOf("pair", "localhost:$port"))
 
         /* Sleep to allow shell to catch up */
         Thread.sleep(1000)
 
         /* Pipe pairing code */
-        PrintStream(pairShell.outputStream).apply {
+        PrintStream(pairShell?.outputStream).apply {
             println(pairingCode)
             flush()
         }
 
         /* Continue once finished pairing */
-        pairShell.waitFor()
+        pairShell?.waitFor()
     }
 
-    fun send(redirect: Boolean, vararg command: String): Process {
-        val commandList = ArrayList<String>().apply {
-            add(adbPath)
-            for (piece in command)
-                add(piece)
+    /**
+     * Send a raw ADB command
+     */
+    private fun adb(redirect: Boolean, command: List<String>): Process? {
+        val commandList = command.toMutableList().also {
+            it.add(0, adbPath)
         }
+        return shell(redirect, commandList)
+    }
 
-        return ProcessBuilder(commandList)
+    /**
+     * Send a raw shell command
+     */
+    private fun shell(redirect: Boolean, command: List<String>): Process? {
+        val processBuilder = ProcessBuilder(command)
+            .directory(context.filesDir)
             .apply {
                 if (redirect) {
                     redirectErrorStream(true)
@@ -102,9 +185,18 @@ class ADB(private val context: Context) {
                     put("TMPDIR", context.cacheDir.path)
                 }
             }
-            .start()
+
+        return try {
+            processBuilder.start()
+        } catch (e: IOException) {
+            e.printStackTrace()
+            null
+        }
     }
 
+    /**
+     * Execute a script
+     */
     fun sendScript(code: String) {
         /* Store script locally */
         val internalScript = File(scriptPath).apply {
@@ -115,17 +207,28 @@ class ADB(private val context: Context) {
         }
 
         /* Execute the script here */
-        sendToAdbShellProcess("sh ${internalScript.absolutePath}")
+        sendToShellProcess("sh ${internalScript.absolutePath}")
     }
 
-    fun sendToAdbShellProcess(msg: String) {
-        PrintStream(shellProcess.outputStream).apply {
+    /**
+     * Send commands directly to the shell process
+     */
+    fun sendToShellProcess(msg: String) {
+        if (shellProcess == null || shellProcess?.outputStream == null)
+            return
+        PrintStream(shellProcess!!.outputStream!!).apply {
             println(msg)
             flush()
         }
     }
 
+    /**
+     * Write a debug message to the user
+     */
     fun debug(msg: String) {
-        outputBufferFile.appendText("DEBUG: $msg" + System.lineSeparator())
+        synchronized(outputBufferFile) {
+            if (outputBufferFile.exists())
+                outputBufferFile.appendText(">>> $msg" + System.lineSeparator())
+        }
     }
 }
